@@ -189,15 +189,15 @@ int main()
         return a*b;
     };
 
-    server += get<std::string>() / "util" / "to-string" / Arg<int>("value") = [](int i) {
-        return std::to_string(i);
+    server += get<int>() / "math" / "digits" / Arg<int>("value") = [](int i) {
+        return std::to_string(i).size();
     };
 
 
-    std::cout << server( "/math/4/times/a5" )   << std::endl;
-    std::cout << server( "/math/10/minus/2" )  << std::endl;
-    std::cout << server( "/math/3/plus/4" )    << std::endl;
-    std::cout << server( "/util/to-string/4" ) << std::endl;
+    std::cout << server( "/math/4/times/5" )  << std::endl; //Prints 20
+    std::cout << server( "/math/10/minus/2" ) << std::endl; //Prints 8
+    std::cout << server( "/math/3/plus/4" )   << std::endl; //Prints 7
+    std::cout << server( "/math/digits/42" )  << std::endl; //Prints 2
 
     return 0;
 }
