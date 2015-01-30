@@ -189,15 +189,21 @@ int main()
         return a*b;
     };
 
-    server += get<int>() / "math" / "digits" / Arg<int>("value") = [](int i) {
-        return std::to_string(i).size();
+    server += get<int>() / "string" / "length" / Arg<std::string>("value") = [](std::string const &s) {
+        return s.size();
+    };
+
+    server += get<std::string>() / "string" / "reverse" / Arg<std::string>("value") = [](std::string s) {
+        std::reverse(s.begin(), s.end());
+        return s;
     };
 
 
     std::cout << server( "/math/4/times/5" )  << std::endl; //Prints 20
     std::cout << server( "/math/10/minus/2" ) << std::endl; //Prints 8
     std::cout << server( "/math/3/plus/4" )   << std::endl; //Prints 7
-    std::cout << server( "/math/digits/42" )  << std::endl; //Prints 2
+    std::cout << server( "/string/length/potato" ) << std::endl; //Prints 6
+    std::cout << server( "/string/reverse/potato" ) << std::endl; //Prints otatop
 
     return 0;
 }
