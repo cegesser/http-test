@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <algorithm>
 #include <memory>
 
 template<typename T>
@@ -137,14 +138,107 @@ ServiceBuilder<Ret,Args..., T> operator/(ServiceBuilder<Ret,Args...> &&s, const 
 
 template<typename Ret>
 ServiceBuilder<Ret> get() {
-    return ServiceBuilder<Ret>();
+    return ServiceBuilder<Ret>{ { { PathPart::Const, "GET" } } };
 }
 
+
+#include <boost/asio.hpp>
+#include <boost/algorithm/string/trim.hpp>
+
+struct Server;
+std::string server_handle(Server &server, const std::string &uri);
+
+class session
+        : public std::enable_shared_from_this<session>
+{
+public:
+    session(boost::asio::ip::tcp::socket &&socket, Server&server)
+        : socket_(std::move(socket)), server_(server)
+    {
+    }
+
+    void start()
+    {
+        read_status();
+    }
+
+private:
+    void read_status()
+    {
+        auto self(shared_from_this());
+        boost::asio::async_read_until(socket_, buffer_, "\r\n", [this, self](boost::system::error_code ec, std::size_t )
+        {
+            std::string version;
+            char sp1, sp2, cr, lf;
+            std::istream is(&buffer_);
+            is.unsetf(std::ios_base::skipws);
+            is >> request_method_ >> sp1 >> request_uri_ >> sp2 >> version >> cr >> lf;
+
+            read_header();
+        });
+    }
+
+    void read_header()
+    {
+        auto self(shared_from_this());
+        boost::asio::async_read_until(socket_, buffer_, "\r\n", [this, self](boost::system::error_code ec, std::size_t )
+        {
+            std::string header_line = [this](){
+                std::string header_line;
+                std::istream is(&buffer_);
+                std::getline(is, header_line);
+                boost::algorithm::trim(header_line);
+                return header_line;
+            }();
+
+            if (!header_line.empty()) {
+                auto sep = header_line.find(':');
+                auto key = header_line.substr(0, sep);
+                auto value = header_line.substr(sep+1);
+
+                request_headers_.emplace_back(std::move(key), std::move(value));
+
+                read_header();
+            }
+            else {
+                auto resp = [&]() -> std::string{
+                    try {
+                        const std::string resp = server_handle(server_, request_method_ + request_uri_);
+                        return "HTTP/1.1 200 OK\r\n"
+                               "Connection: close\r\n"
+                               "Content-Type: text/plain\r\n"
+                               "\r\n" + resp;
+                    }
+                    catch (...) {
+                        return "HTTP/1.1 404 Not Found\r\n"
+                               "Connection: close\r\n"
+                               "\r\n" ;
+                    }
+                }();
+
+
+                boost::asio::write(socket_, boost::asio::buffer(resp));
+                socket_.close();
+            }
+        });
+    }
+
+    boost::asio::ip::tcp::socket socket_;
+    boost::asio::streambuf buffer_;
+
+    std::vector<std::pair<std::string,std::string>> request_headers_;
+    std::string request_method_, request_uri_;
+    Server &server_;
+};
 
 struct Server {
     std::vector<Service> services;
 
-    Server(const std::string &host, unsigned short port) {
+    Server(boost::asio::io_service& io_service, unsigned short port)
+        : acceptor_(io_service, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port)),
+              socket_(io_service)
+    {
+        do_accept();
     }
 
     void operator += (Service &&callable) {
@@ -165,17 +259,39 @@ private:
         std::vector<std::string> args;
         std::stringstream ss(uri);
         std::string item;
-        std::getline(ss, item, '/');//skips first '/'
+
         while (std::getline(ss, item, '/')) {
             args.push_back(item);
         }
         return args;
     }
+
+    void do_accept()
+    {
+        acceptor_.async_accept(socket_, [this](boost::system::error_code ec)
+        {
+            if (!ec)
+            {
+                std::make_shared<session>(std::move(socket_), *this)->start();
+            }
+
+            do_accept();
+        });
+    }
+
+    boost::asio::ip::tcp::acceptor acceptor_;
+    boost::asio::ip::tcp::socket socket_;
 };
+
+std::string server_handle(Server &server, const std::string &uri)
+{
+    return server(uri);
+}
 
 int main()
 {
-    Server server("localhost", 8080);
+    boost::asio::io_service io_service;
+    Server server(io_service, 8080);
 
     server += get<int>() / "math" / Arg<int>("value1") / "plus" / Arg<int>("value2") = [](int a, int b) {
         return a+b;
@@ -198,12 +314,7 @@ int main()
         return s;
     };
 
-
-    std::cout << server( "/math/4/times/5" )  << std::endl; //Prints 20
-    std::cout << server( "/math/10/minus/2" ) << std::endl; //Prints 8
-    std::cout << server( "/math/3/plus/4" )   << std::endl; //Prints 7
-    std::cout << server( "/string/length/potato" ) << std::endl; //Prints 6
-    std::cout << server( "/string/reverse/potato" ) << std::endl; //Prints otatop
+    io_service.run();
 
     return 0;
 }
