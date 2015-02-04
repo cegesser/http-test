@@ -7,14 +7,21 @@
 #include <memory>
 
 template<typename T>
-struct Arg {
+struct Param {
     const char *name;
 
-    Arg(const char *name) : name(name)  {}
+    Param(const char *name) : name(name)  {}
+};
+
+template<typename T>
+struct Header {
+    const char *name;
+
+    Header(const char *name) : name(name)  {}
 };
 
 struct PathPart {
-    enum Type { Const, Var };
+    enum Type { Const, Header, Param };
     Type type;
     std::string value;
 };
@@ -49,6 +56,42 @@ template<int N, int ...S> struct gen_seq : gen_seq<N-1, N-1, S...> {};
 
 template<int ...S> struct gen_seq<0, S...>{ typedef seq<S...> type; };
 
+
+struct Request {
+
+    Request(const std::string &&method, std::string &&uri, std::vector<std::pair<std::string,std::string>> &&headers)
+        : headers(std::move(headers))
+    {
+        uri_parts.push_back(std::move(method));
+
+        std::stringstream ss(std::move(uri));
+        std::string item;
+
+        std::getline(ss, item, '/');
+
+        while (std::getline(ss, item, '/')) {
+            uri_parts.push_back(item);
+        }
+    }
+
+    const std::string &header(const std::string &name) const {
+        auto iter = std::find_if(begin(headers), end(headers),
+                                 [&](const std::pair<std::string,std::string> &pair){
+            return pair.first == name;
+        });
+        if (iter == end(headers)) {
+            static const std::string empty_str;
+            return empty_str;
+        }
+        else {
+            return iter->second;
+        }
+    }
+
+    std::vector<std::string> uri_parts;
+    std::vector<std::pair<std::string,std::string>> headers;
+};
+
 class Service {
 public:
     template<typename Ret, typename ...Args>
@@ -59,29 +102,49 @@ public:
     Service(Service &&that)
         : m_impl(std::move(that.m_impl)) {}
 
-    std::string operator()(const std::vector<std::string> &uri) {
-        return m_impl->call(uri);
+    std::string operator()(Request &&req) {
+        return m_impl->call(std::move(req));
     }
 
     const std::vector<PathPart> &signature() const { return m_impl->signature; }
 
-    bool signature_matches(const std::vector<std::string> &uri) {
-        if (uri.size() != signature().size()) {
-            return false;
-        }
-        for (unsigned i=0; i<uri.size(); ++i) {
-            const PathPart &sig_part = signature()[i];
-            if (sig_part.type == PathPart::Const && sig_part.value != uri[i]) {
-                return false;
+    bool signature_matches(const std::vector<std::string> &uri) const {
+        auto uri_iter = uri.begin();
+        const auto uri_end = uri.end();
+
+        auto sig_iter = signature().begin();
+        const auto sig_end = signature().end();
+
+        while (sig_iter != sig_end) {
+            if (sig_iter->type == PathPart::Const) {
+                if (uri_iter == uri_end || sig_iter->value != *uri_iter) {
+                    return false;
+                }
+                ++sig_iter;
+                ++uri_iter;
+                continue;
+            }
+            if (sig_iter->type == PathPart::Param) {
+                if (uri_iter == uri_end) {
+                    return false;
+                }
+                ++sig_iter;
+                ++uri_iter;
+                continue;
+            }
+            if (sig_iter->type == PathPart::Header) {
+                ++sig_iter;
+                continue;
             }
         }
-        return true;
+
+        return uri_iter == uri_end && sig_iter == sig_end;
     }
 
 private:
     struct Ops {
         std::vector<PathPart> signature;
-        virtual std::string call(const std::vector<std::string> &) = 0;
+        virtual std::string call(Request &&req) = 0;
     };
     std::unique_ptr<Ops> m_impl;
 
@@ -93,20 +156,27 @@ private:
             signature = std::move(sig);
         }
 
-        std::string call(const std::vector<std::string> &args) override {
-            std::vector<const std::string*> uri_args;
-            for (unsigned i=0; i<signature.size(); ++i) {
-                if (signature[i].type == PathPart::Var) {
-                    uri_args.push_back(&args[i]);
+        std::string call(Request &&req) override {
+            std::vector<const std::string*> args;
+            for (unsigned s=0, u=0; s<signature.size(); ++s) {
+                const auto &part = signature[s];
+                if (part.type == PathPart::Param) {
+                    args.push_back(&req.uri_parts[u++]);
+                }
+                else if (part.type == PathPart::Const) {
+                    ++u;
+                }
+                else if (part.type == PathPart::Header) {
+                    args.push_back(&req.header(part.value));
                 }
             }
-            return to_string_helper( call_func( uri_args, typename gen_seq<sizeof...(Args)>::type() ) );
+            return to_string_helper( call_func( args, typename gen_seq<sizeof...(Args)>::type() ) );
         }
 
         template<int ...S>
-        Ret call_func(const std::vector<const std::string*> &uri_args, seq<S...>)
+        Ret call_func(const std::vector<const std::string*> &args, seq<S...>)
         {
-            return func( from_string_helper<Args>( *uri_args[S] )... );
+            return func( from_string_helper<Args>( *args[S] )... );
         }
     };
 };
@@ -130,9 +200,16 @@ ServiceBuilder<Ret,Args...> operator/(ServiceBuilder<Ret,Args...> &&s, const cha
 }
 
 template<typename Ret, typename ...Args, typename T>
-ServiceBuilder<Ret,Args..., T> operator/(ServiceBuilder<Ret,Args...> &&s, const Arg<T> &&arg) {
+ServiceBuilder<Ret,Args..., T> operator/(ServiceBuilder<Ret,Args...> &&s, const Param<T> &&arg) {
     ServiceBuilder<Ret,Args...,T> result { std::move(s.signature) };
-    result.signature.push_back({PathPart::Var, arg.name});
+    result.signature.push_back({PathPart::Param, arg.name});
+    return result;
+}
+
+template<typename Ret, typename ...Args, typename T>
+ServiceBuilder<Ret,Args..., T> operator/(ServiceBuilder<Ret,Args...> &&s, const Header<T> &&arg) {
+    ServiceBuilder<Ret,Args...,T> result { std::move(s.signature) };
+    result.signature.push_back({PathPart::Header, arg.name});
     return result;
 }
 
@@ -146,7 +223,10 @@ ServiceBuilder<Ret> get() {
 #include <boost/algorithm/string/trim.hpp>
 
 struct Server;
-std::string server_handle(Server &server, const std::string &uri);
+
+
+
+std::string server_handle(Server &server, Request &&request);
 
 class session
         : public std::enable_shared_from_this<session>
@@ -203,7 +283,8 @@ private:
             else {
                 auto resp = [&]() -> std::string{
                     try {
-                        const std::string resp = server_handle(server_, request_method_ + request_uri_);
+                        Request req(std::move(request_method_), std::move(request_uri_), std::move(request_headers_));
+                        const std::string resp = server_handle(server_, std::move(req));
                         return "HTTP/1.1 200 OK\r\n"
                                "Connection: close\r\n"
                                "Content-Type: text/plain\r\n"
@@ -245,26 +326,15 @@ struct Server {
         services.push_back(std::move(callable));
     }
 
-    std::string operator()(const std::string &uri) {
-        std::vector<std::string> args = parse(uri);
+    std::string operator()(Request &&req) {
         for (Service &service : services) {
-            if (service.signature_matches(args)) {
-                return service(args);
+            if (service.signature_matches(req.uri_parts)) {
+                return service(std::move(req));
             }
         }
         throw "batat";
     }
 private:
-    std::vector<std::string> parse(const std::string &uri) {
-        std::vector<std::string> args;
-        std::stringstream ss(uri);
-        std::string item;
-
-        while (std::getline(ss, item, '/')) {
-            args.push_back(item);
-        }
-        return args;
-    }
 
     void do_accept()
     {
@@ -283,9 +353,11 @@ private:
     boost::asio::ip::tcp::socket socket_;
 };
 
-std::string server_handle(Server &server, const std::string &uri)
+
+
+std::string server_handle(Server &server, Request &&request)
 {
-    return server(uri);
+    return server(std::move(request));
 }
 
 int main()
@@ -293,24 +365,29 @@ int main()
     boost::asio::io_service io_service;
     Server server(io_service, 8080);
 
-    server += get<int>() / "math" / Arg<int>("value1") / "plus" / Arg<int>("value2") = [](int a, int b) {
+    server += get<int>() / "math" / Param<int>("value1") / "plus" / Param<int>("value2") = [](int a, int b) {
         return a+b;
     };
 
-    server += get<int>() / "math" / Arg<int>("value1") / "minus" / Arg<int>("value2") = [](int a, int b) {
+    server += get<int>() / "math" / Param<int>("value1") / "minus" / Param<int>("value2") = [](int a, int b) {
         return a-b;
     };
 
-    server += get<int>() / "math" / Arg<int>("value1") / "times" / Arg<int>("value2") = [](int a, int b) {
+    server += get<int>() / "math" / Param<int>("value1") / "times" / Param<int>("value2") = [](int a, int b) {
         return a*b;
     };
 
-    server += get<int>() / "string" / "length" / Arg<std::string>("value") = [](std::string const &s) {
-        return s.size();
+    server += get<int>() / "string" / "length" / Param<std::string>("value") = [](std::string const &s) {
+        return static_cast<int>( s.size() );
     };
 
-    server += get<std::string>() / "string" / "reverse" / Arg<std::string>("value") = [](std::string s) {
+    server += get<std::string>() / "string" / "reverse" / Param<std::string>("value") = [](std::string s) {
         std::reverse(s.begin(), s.end());
+        return s;
+    };
+
+    server += get<std::string>() / "header" / Header<std::string>("Accept") = [](std::string s) {
+
         return s;
     };
 
